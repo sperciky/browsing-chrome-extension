@@ -46,19 +46,47 @@ function setError(msg) {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
-// URL.createObjectURL is not available in MV3 service workers.
-// Convert bytes to a base64 data URI that chrome.downloads.download accepts.
-function uint8ArrayToDataUrl(bytes, mimeType = "application/pdf") {
-  let binary = "";
-  const CHUNK = 32768; // avoid stack overflow on spread
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    binary += String.fromCharCode(...bytes.subarray(i, Math.min(bytes.length, i + CHUNK)));
-  }
-  return `data:${mimeType};base64,${btoa(binary)}`;
-}
-
 function isJpeg(b) { return b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF; }
 function isPng(b)  { return b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47; }
+
+// ─── IndexedDB helpers (shared with offscreen.js via the same origin) ─────
+
+function openPdfIDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open("pdf-downloader", 1);
+    req.onupgradeneeded = e => e.target.result.createObjectStore("pdfs");
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror = e => reject(e.target.error);
+  });
+}
+
+async function storePdfInIDB(bytes) {
+  const db = await openPdfIDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("pdfs", "readwrite");
+    tx.objectStore("pdfs").put(bytes, "pending");
+    tx.oncomplete = resolve;
+    tx.onerror = e => reject(e.target.error);
+  });
+}
+
+// ─── Offscreen document trigger ───────────────────────────────────────────
+// URL.createObjectURL is not available in MV3 service workers.
+// We delegate blob-URL creation + chrome.downloads call to an offscreen page.
+
+async function triggerOffscreenDownload(filename) {
+  const offscreenUrl = chrome.runtime.getURL("offscreen.html");
+  const hasDoc = await chrome.offscreen.hasDocument().catch(() => false);
+  if (!hasDoc) {
+    await chrome.offscreen.createDocument({
+      url: offscreenUrl,
+      reasons: ["BLOBS"],
+      justification: "Create blob: URL for large PDF download — avoids data URI size limits",
+    });
+  }
+  // offscreen.js listens for this and does the actual download
+  chrome.runtime.sendMessage({ type: "OFFSCREEN_DOWNLOAD", filename });
+}
 
 async function fetchImageBytes(url) {
   console.log(`[bg] direct fetch: ${url}`);
@@ -256,33 +284,34 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         state.total  = total;
         broadcastState();
       })
-      .then(pdfBytes => {
+      .then(async pdfBytes => {
         state.phase = "saving";
         broadcastState();
-
-        const dataUrl = uint8ArrayToDataUrl(pdfBytes);
-
-        chrome.downloads.download({
-          url: dataUrl,
-          filename: `${folderName}/${filename}`,
-          saveAs: false,
-          conflictAction: "uniquify",
-        }, () => {
-          if (chrome.runtime.lastError) {
-            setError(chrome.runtime.lastError.message);
-          } else {
-            state.running   = false;
-            state.phase     = "done";
-            state.pageCount = pages.length;
-            broadcastState();
-          }
-        });
+        console.log(`[bg] PDF built: ${pdfBytes.length} bytes — storing in IDB`);
+        await storePdfInIDB(pdfBytes);
+        console.log(`[bg] IDB write ok — triggering offscreen download`);
+        await triggerOffscreenDownload(`${folderName}/${filename}`);
+        // Final state is set when OFFSCREEN_DONE arrives (see message router below)
       })
       .catch(err => setError(err.message || String(err)));
 
       sendResponse({ ok: true });
       return true;
     }
+
+    case "OFFSCREEN_DONE":
+      console.log("[bg] offscreen download complete");
+      state.running = false;
+      state.phase   = "done";
+      broadcastState();
+      sendResponse({ ok: true });
+      return true;
+
+    case "OFFSCREEN_ERROR":
+      console.error(`[bg] offscreen download error: ${msg.message}`);
+      setError(msg.message || "Download failed in offscreen document");
+      sendResponse({ ok: true });
+      return true;
 
     case "DONE":
       state.running   = false;

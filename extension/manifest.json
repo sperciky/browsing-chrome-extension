@@ -8,7 +8,8 @@
     "scripting",
     "downloads",
     "storage",
-    "webNavigation"
+    "webNavigation",
+    "offscreen"
   ],
   "host_permissions": [
     "https://docviewer.yandex.ru/*",
