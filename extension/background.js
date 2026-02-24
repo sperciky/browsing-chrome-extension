@@ -66,9 +66,32 @@ async function fetchImageBytes(url) {
   return new Uint8Array(await r.arrayBuffer());
 }
 
+// Proxy an image fetch through the content script so it runs with the tab's
+// full cookie context (avoids SameSite / CDN CORS issues in the SW).
+function fetchViaContentScript(tabId, frameId, url) {
+  return new Promise((resolve, reject) => {
+    const opts = frameId != null ? { frameId } : {};
+    chrome.tabs.sendMessage(tabId, { type: "FETCH_IMAGE", url }, opts, (response) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+      if (!response?.ok) {
+        reject(new Error(response?.error || "Content script fetch failed"));
+        return;
+      }
+      const binaryStr = atob(response.imageData);
+      const bytes = new Uint8Array(binaryStr.length);
+      for (let b = 0; b < binaryStr.length; b++) bytes[b] = binaryStr.charCodeAt(b);
+      resolve(bytes);
+    });
+  });
+}
+
 // ─── PDF Builder ──────────────────────────────────────────────────────────
 
-async function buildPDF(pages, onProgress) {
+// context = { tabId, frameId } – used to proxy fetches through the content script
+async function buildPDF(pages, context, onProgress) {
   const pdfDoc = await PDFDocument.create();
 
   for (let i = 0; i < pages.length; i++) {
@@ -77,11 +100,17 @@ async function buildPDF(pages, onProgress) {
 
     let bytes;
     try {
-      bytes = await fetchImageBytes(url);
-    } catch (e) {
-      console.warn(`[bg] skip page ${i + 1}: ${e.message}`);
-      pdfDoc.addPage([A4_W, A4_H]);
-      continue;
+      // Primary: fetch via content script (has full tab cookie context, handles WebP→JPEG)
+      bytes = await fetchViaContentScript(context.tabId, context.frameId, url);
+    } catch (_) {
+      // Fallback: direct fetch from service worker
+      try {
+        bytes = await fetchImageBytes(url);
+      } catch (e) {
+        console.warn(`[bg] skip page ${i + 1}: ${e.message}`);
+        pdfDoc.addPage([A4_W, A4_H]);
+        continue;
+      }
     }
 
     let embeddedImage;
@@ -194,6 +223,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case "BUILD_PDF": {
       const { pages, folderName, filename } = msg;
+      const context = { tabId: sender.tab?.id, frameId: sender.frameId };
 
       state.phase      = "building";
       state.loaded     = 0;
@@ -202,7 +232,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       state.filename   = filename;
       broadcastState();
 
-      buildPDF(pages, (current, total) => {
+      buildPDF(pages, context, (current, total) => {
         state.loaded = current;
         state.total  = total;
         broadcastState();
