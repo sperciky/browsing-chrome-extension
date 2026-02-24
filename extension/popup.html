@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Yandex Docs PDF Downloader</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 320px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 13px;
+      color: #202124;
+      background: #fff;
+    }
+
+    /* ── Header ────────────────────────────────── */
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 16px 10px;
+      border-bottom: 1px solid #e8eaed;
+    }
+    .header-icon {
+      width: 28px;
+      height: 28px;
+      flex-shrink: 0;
+    }
+    .header-title {
+      font-size: 15px;
+      font-weight: 600;
+      color: #1a73e8;
+    }
+
+    /* ── Main content ───────────────────────────── */
+    .content {
+      padding: 14px 16px;
+    }
+
+    /* ── Button ─────────────────────────────────── */
+    #downloadBtn {
+      width: 100%;
+      padding: 10px 16px;
+      font-size: 14px;
+      font-weight: 600;
+      color: #fff;
+      background: #1a73e8;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 0.15s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+    #downloadBtn:hover:not(:disabled) { background: #1557b0; }
+    #downloadBtn:disabled {
+      background: #9aa0a6;
+      cursor: not-allowed;
+    }
+
+    /* ── Status section ─────────────────────────── */
+    #statusSection {
+      margin-top: 14px;
+      display: none;
+    }
+
+    .status-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 6px;
+    }
+    .status-label {
+      font-size: 12px;
+      color: #5f6368;
+    }
+    .status-value {
+      font-size: 12px;
+      font-weight: 500;
+      color: #202124;
+      text-align: right;
+      max-width: 180px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* ── Progress bar ───────────────────────────── */
+    .progress-bar-wrapper {
+      background: #e8eaed;
+      border-radius: 4px;
+      height: 6px;
+      overflow: hidden;
+      margin-top: 8px;
+    }
+    #progressBar {
+      height: 100%;
+      background: #1a73e8;
+      border-radius: 4px;
+      width: 0%;
+      transition: width 0.3s ease;
+    }
+
+    /* ── Phase message ──────────────────────────── */
+    #phaseMsg {
+      margin-top: 10px;
+      font-size: 12px;
+      color: #5f6368;
+      min-height: 16px;
+    }
+
+    /* ── Error ──────────────────────────────────── */
+    #errorBox {
+      display: none;
+      margin-top: 10px;
+      padding: 8px 10px;
+      background: #fce8e6;
+      border-left: 3px solid #d93025;
+      border-radius: 4px;
+      font-size: 12px;
+      color: #c5221f;
+      word-break: break-word;
+    }
+
+    /* ── Success ────────────────────────────────── */
+    #successBox {
+      display: none;
+      margin-top: 10px;
+      padding: 8px 10px;
+      background: #e6f4ea;
+      border-left: 3px solid #1e8e3e;
+      border-radius: 4px;
+      font-size: 12px;
+      color: #137333;
+    }
+
+    /* ── Folder name display ────────────────────── */
+    #folderInfo {
+      display: none;
+      margin-top: 10px;
+      padding: 8px 10px;
+      background: #f8f9fa;
+      border-radius: 4px;
+      font-size: 11px;
+      color: #5f6368;
+    }
+    #folderInfo code {
+      font-family: monospace;
+      color: #202124;
+      font-size: 11px;
+    }
+
+    /* ── Spinner ─────────────────────────────────── */
+    .spinner {
+      width: 16px;
+      height: 16px;
+      border: 2px solid rgba(255,255,255,0.4);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      display: none;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Footer ─────────────────────────────────── */
+    .footer {
+      padding: 8px 16px 12px;
+      font-size: 11px;
+      color: #9aa0a6;
+      text-align: center;
+      border-top: 1px solid #e8eaed;
+      margin-top: 14px;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <!-- PDF icon (inline SVG) -->
+    <svg class="header-icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <rect width="24" height="24" rx="4" fill="#1a73e8"/>
+      <path d="M6 4h8l4 4v12H6V4z" fill="white" opacity="0.9"/>
+      <path d="M14 4l4 4h-4V4z" fill="#cfe2ff"/>
+      <text x="8" y="16" font-size="5" fill="#1a73e8" font-family="Arial" font-weight="bold">PDF</text>
+    </svg>
+    <span class="header-title">PDF Downloader</span>
+  </div>
+
+  <div class="content">
+    <button id="downloadBtn">
+      <span class="spinner" id="btnSpinner"></span>
+      <span id="btnText">Download PDF</span>
+    </button>
+
+    <div id="statusSection">
+      <div class="status-row">
+        <span class="status-label">Pages processed</span>
+        <span class="status-value" id="pagesValue">0 / ?</span>
+      </div>
+      <div class="status-row">
+        <span class="status-label">Scroll progress</span>
+        <span class="status-value" id="scrollValue">0%</span>
+      </div>
+      <div class="progress-bar-wrapper">
+        <div id="progressBar"></div>
+      </div>
+      <div id="phaseMsg"></div>
+    </div>
+
+    <div id="folderInfo"></div>
+    <div id="errorBox"></div>
+    <div id="successBox"></div>
+  </div>
+
+  <div class="footer">Yandex Docs PDF Downloader &middot; MV3</div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
