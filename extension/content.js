@@ -373,9 +373,63 @@
     }
   }
 
+  // ─── Image fetch proxy (called by background service worker) ─────────────
+  //
+  // The background SW runs from chrome-extension:// origin, so its fetch()
+  // may not carry the page's SameSite cookies and can't reach unlisted CDNs.
+  // We proxy image fetches through the content script, which shares the tab's
+  // full cookie context.  WebP images (unsupported by pdf-lib) are converted
+  // to JPEG here via canvas before the bytes are returned.
+
+  function bufToBase64(buf) {
+    const u8 = new Uint8Array(buf);
+    let binary = "";
+    const CHUNK = 32768;
+    for (let i = 0; i < u8.length; i += CHUNK) {
+      binary += String.fromCharCode(...u8.subarray(i, Math.min(u8.length, i + CHUNK)));
+    }
+    return btoa(binary);
+  }
+
+  function normalizeImageBuffer(buf) {
+    const u8 = new Uint8Array(buf);
+    // WebP magic: RIFF????WEBP
+    const isWebP = u8.length > 11 &&
+      u8[0] === 0x52 && u8[1] === 0x49 && u8[2] === 0x46 && u8[3] === 0x46 &&
+      u8[8] === 0x57 && u8[9] === 0x45 && u8[10] === 0x42 && u8[11] === 0x50;
+    if (!isWebP) return Promise.resolve(buf);
+    return new Promise((resolve, reject) => {
+      const blob = new Blob([buf], { type: "image/webp" });
+      const blobUrl = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        canvas.width  = img.naturalWidth  || 794;
+        canvas.height = img.naturalHeight || 1124;
+        canvas.getContext("2d").drawImage(img, 0, 0);
+        URL.revokeObjectURL(blobUrl);
+        canvas.toBlob(
+          b2 => b2.arrayBuffer().then(resolve).catch(reject),
+          "image/jpeg", 0.92
+        );
+      };
+      img.onerror = () => { URL.revokeObjectURL(blobUrl); reject(new Error("WebP decode failed")); };
+      img.src = blobUrl;
+    });
+  }
+
   // ─── Message Listener ─────────────────────────────────────────────────────
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg.type === "FETCH_IMAGE") {
+      fetch(msg.url, { credentials: "include" })
+        .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.arrayBuffer(); })
+        .then(buf => normalizeImageBuffer(buf))
+        .then(buf => sendResponse({ ok: true, imageData: bufToBase64(buf) }))
+        .catch(e  => sendResponse({ ok: false, error: e.message }));
+      return true; // keep message channel open for async response
+    }
+
     if (msg.type !== "START_DOWNLOAD") return;
     if (isViewerFrame()) {
       sendResponse({ accepted: true });
