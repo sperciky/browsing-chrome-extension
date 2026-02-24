@@ -170,37 +170,63 @@ async function buildPDF(pages, context, onProgress) {
   console.log(`[bg] buildPDF: ${pages.length} pages, tabId=${context.tabId}, frameId=${context.frameId}`);
   pages.forEach((p, i) => console.log(`[bg]   page ${i + 1}: ${p.url} (${p.width}×${p.height})`));
 
-  let totalFetchMs = 0;
+  // ── Phase 1: Parallel fetch ──────────────────────────────────────────────
+  // Pages are independent — fetch up to CONCURRENCY at once.
+  // Serial: 146 pages × ~550ms avg ≈ 80s.  Parallel ×4 ≈ 20s wall-clock.
+  const CONCURRENCY = 4;
+  const tFetchPhase = performance.now();
+  const fetchedBytes = new Array(pages.length).fill(null);
+  let fetchQueueIdx = 0;   // next page index to claim — safe in single-threaded JS
+  let fetchedCount  = 0;   // for monotonic progress reporting
+  let totalFetchMs  = 0;
+
+  async function fetchWorker() {
+    while (true) {
+      const i = fetchQueueIdx++;
+      if (i >= pages.length) return;
+      const { url } = pages[i];
+      const tFetch = performance.now();
+      let bytes = null;
+      try {
+        bytes = await fetchViaContentScript(context.tabId, context.frameId, url);
+        const fetchMs = performance.now() - tFetch;
+        totalFetchMs += fetchMs;
+        console.log(`[timing log] page ${i + 1} fetch (content-script): ${ms(fetchMs)} — ${bytes.length} bytes`);
+      } catch (csErr) {
+        console.warn(`[bg] page ${i + 1}: content-script fetch failed (${csErr.message}), trying direct fetch`);
+        try {
+          bytes = await fetchImageBytes(url);
+          const fetchMs = performance.now() - tFetch;
+          totalFetchMs += fetchMs;
+          console.log(`[timing log] page ${i + 1} fetch (direct fallback): ${ms(fetchMs)} — ${bytes.length} bytes`);
+        } catch (e) {
+          console.warn(`[bg] page ${i + 1}: BOTH fetches failed (${ms(performance.now() - tFetch)}) — blank page. Error: ${e.message}`);
+        }
+      }
+      fetchedBytes[i] = bytes;
+      fetchedCount++;
+      if (onProgress) onProgress(fetchedCount, pages.length);
+    }
+  }
+
+  await Promise.all(Array.from({ length: CONCURRENCY }, fetchWorker));
+
+  const fetchWallMs = performance.now() - tFetchPhase;
+  console.log(`[timing log] fetch phase — wall-clock: ${ms(fetchWallMs)}, serial sum: ${ms(totalFetchMs)}, speedup: ${(totalFetchMs / fetchWallMs).toFixed(1)}×`);
+
+  // ── Phase 2: Embed (serial — pdf-lib is not re-entrant) ──────────────────
+  const tEmbedPhase = performance.now();
   let totalEmbedMs = 0;
 
   for (let i = 0; i < pages.length; i++) {
-    const { url, width, height } = pages[i];
-    if (onProgress) onProgress(i + 1, pages.length);
+    const bytes = fetchedBytes[i];
+    fetchedBytes[i] = null; // release reference so GC can reclaim while we embed later pages
 
-    let bytes;
-    const tFetch = performance.now();
-    try {
-      // Primary: fetch via content script (has full tab cookie context, handles WebP→JPEG)
-      bytes = await fetchViaContentScript(context.tabId, context.frameId, url);
-      const fetchMs = performance.now() - tFetch;
-      totalFetchMs += fetchMs;
-      console.log(`[timing log] page ${i + 1} fetch (content-script): ${ms(fetchMs)} — ${bytes.length} bytes`);
-    } catch (csErr) {
-      console.warn(`[bg] page ${i + 1}: content-script fetch failed (${csErr.message}), trying direct fetch`);
-      // Fallback: direct fetch from service worker
-      try {
-        bytes = await fetchImageBytes(url);
-        const fetchMs = performance.now() - tFetch;
-        totalFetchMs += fetchMs;
-        console.log(`[timing log] page ${i + 1} fetch (direct fallback): ${ms(fetchMs)} — ${bytes.length} bytes`);
-      } catch (e) {
-        console.warn(`[bg] page ${i + 1}: BOTH fetches failed (${ms(performance.now() - tFetch)}) — adding blank page. Error: ${e.message}`);
-        pdfDoc.addPage([A4_W, A4_H]);
-        continue;
-      }
+    if (!bytes) {
+      pdfDoc.addPage([A4_W, A4_H]);
+      continue;
     }
 
-    // Log first 4 bytes to identify format
     const fmt = isJpeg(bytes) ? "JPEG" : isPng(bytes) ? "PNG" : `UNKNOWN(0x${bytes[0].toString(16)}${bytes[1].toString(16)}${bytes[2].toString(16)}${bytes[3].toString(16)})`;
     console.log(`[bg] page ${i + 1}: format=${fmt} bytes=${bytes.length}`);
 
@@ -215,7 +241,6 @@ async function buildPDF(pages, context, onProgress) {
       console.log(`[timing log] page ${i + 1} embed: ${ms(embedMs)}`);
     } catch (e) {
       console.warn(`[bg] page ${i + 1}: embed failed (${e.message}), trying alternate format`);
-      // Try the other format as fallback
       try {
         embeddedImage = isPng(bytes) ? await pdfDoc.embedJpg(bytes) : await pdfDoc.embedPng(bytes);
         const embedMs = performance.now() - tEmbed;
