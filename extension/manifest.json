@@ -1,0 +1,50 @@
+{
+  "manifest_version": 3,
+  "name": "Yandex Docs PDF Downloader",
+  "version": "1.0.0",
+  "description": "Downloads PDFs rendered as page images in Yandex Document Viewer",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "downloads",
+    "storage",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "https://docviewer.yandex.ru/*",
+    "https://docs.yandex.ru/*",
+    "https://disk.yandex.ru/*",
+    "https://yandex.ru/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://docviewer.yandex.ru/*",
+        "https://docs.yandex.ru/*",
+        "https://disk.yandex.ru/*",
+        "https://yandex.ru/*"
+      ],
+      "js": ["translator.js", "content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Download PDF"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "lib/pdf-lib.min.js",
+        "lib/pdf-lib.esm.min.js",
+        "pdfBuilder.js"
+      ],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
