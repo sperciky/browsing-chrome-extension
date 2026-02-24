@@ -44,7 +44,18 @@ function setError(msg) {
   broadcastState();
 }
 
-// ─── Image helpers ────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────
+
+// URL.createObjectURL is not available in MV3 service workers.
+// Convert bytes to a base64 data URI that chrome.downloads.download accepts.
+function uint8ArrayToDataUrl(bytes, mimeType = "application/pdf") {
+  let binary = "";
+  const CHUNK = 32768; // avoid stack overflow on spread
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, Math.min(bytes.length, i + CHUNK)));
+  }
+  return `data:${mimeType};base64,${btoa(binary)}`;
+}
 
 function isJpeg(b) { return b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF; }
 function isPng(b)  { return b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47; }
@@ -200,16 +211,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         state.phase = "saving";
         broadcastState();
 
-        const blob    = new Blob([pdfBytes], { type: "application/pdf" });
-        const blobUrl = URL.createObjectURL(blob);
+        const dataUrl = uint8ArrayToDataUrl(pdfBytes);
 
         chrome.downloads.download({
-          url: blobUrl,
+          url: dataUrl,
           filename: `${folderName}/${filename}`,
           saveAs: false,
           conflictAction: "uniquify",
         }, () => {
-          setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
           if (chrome.runtime.lastError) {
             setError(chrome.runtime.lastError.message);
           } else {
