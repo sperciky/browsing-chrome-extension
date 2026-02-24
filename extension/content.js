@@ -124,27 +124,49 @@
     return null;
   }
 
-  // ─── Image Selectors ──────────────────────────────────────────────────────
+  // ─── Shadow-DOM-Aware Image Helpers ──────────────────────────────────────
+  //
+  // Yandex Docs renders each page inside a declarative shadow root:
+  //   <div data-index="N">
+  //     <div class="__page-N">          ← shadow host
+  //       <template shadowrootmode="open">
+  //         <img src="./htmlimage?...">  ← lives here, invisible to
+  //       </template>                      normal querySelectorAll
+  //     </div>
+  //   </div>
+  //
+  // To reach those images we must walk .shadowRoot on every descendant.
 
-  const IMG_SELECTOR = [
-    "img[src*='name=bg-']",
-    "img[src*='htmlimage']",
-    "img[src*='docviewer']",
-    ".js-doc-page img",
-    "[data-index] img",
-    "[class*='pages_'] img",
-    "[class*='page_pdf'] img",
-  ].join(", ");
+  // Return the first <img> inside any open shadow root within `container`,
+  // or fall back to a plain light-DOM img.
+  function getImgFromPageContainer(container) {
+    // Walk all light-DOM descendants; each may have an open shadow root.
+    for (const el of container.querySelectorAll("*")) {
+      if (el.shadowRoot) {
+        const img = el.shadowRoot.querySelector("img");
+        if (img) return img;
+      }
+    }
+    // Unlikely, but handle shadow root directly on the container
+    if (container.shadowRoot) {
+      const img = container.shadowRoot.querySelector("img");
+      if (img) return img;
+    }
+    // Fallback: plain img in light DOM
+    return container.querySelector("img");
+  }
+
+  function isRealImageSrc(src) {
+    return src && !src.startsWith("data:") && src.length > 15;
+  }
 
   function countImages() {
-    const imgs = document.querySelectorAll(IMG_SELECTOR);
-    // Count only those with a real src (not placeholders)
-    let realCount = 0;
-    imgs.forEach(img => {
-      const s = img.src || "";
-      if (s && !s.startsWith("data:") && s.length > 15) realCount++;
-    });
-    return realCount;
+    let n = 0;
+    for (const container of document.querySelectorAll("[data-index]")) {
+      const img = getImgFromPageContainer(container);
+      if (img && isRealImageSrc(img.src)) n++;
+    }
+    return n;
   }
 
   // ─── Scroll to Load All Pages ─────────────────────────────────────────────
@@ -212,8 +234,12 @@
   // ─── Wait for Images ──────────────────────────────────────────────────────
 
   async function waitForImages() {
-    const imgs = Array.from(document.querySelectorAll(IMG_SELECTOR))
-      .filter(img => { const s = img.src || ""; return s && !s.startsWith("data:") && s.length > 15; });
+    // Collect imgs from both shadow DOM and light DOM page containers
+    const imgs = [];
+    for (const container of document.querySelectorAll("[data-index]")) {
+      const img = getImgFromPageContainer(container);
+      if (img && isRealImageSrc(img.src)) imgs.push(img);
+    }
 
     for (let i = 0; i < imgs.length; i++) {
       const img = imgs[i];
@@ -231,25 +257,28 @@
   // ─── Collect Image URLs ───────────────────────────────────────────────────
 
   function collectPageImages() {
-    const allImgs = Array.from(document.querySelectorAll(IMG_SELECTOR));
     const byIndex = new Map();
+    const pageContainers = Array.from(document.querySelectorAll("[data-index]"));
 
-    for (const img of allImgs) {
+    for (const container of pageContainers) {
+      const img = getImgFromPageContainer(container);
+      if (!img) continue;
+
       const rawUrl = img.currentSrc || img.src || "";
-      if (!rawUrl || rawUrl.startsWith("data:") || rawUrl.length < 15) continue;
+      if (!isRealImageSrc(rawUrl)) continue;
 
+      // Page index from bg-N.png URL or from data-index attribute
       let pageIdx;
       const bgMatch = rawUrl.match(/name=bg-(\d+)\.png/i);
       if (bgMatch) {
         pageIdx = parseInt(bgMatch[1], 10);
       } else {
-        const pageEl = img.closest("[data-index]");
-        pageIdx = pageEl ? parseInt(pageEl.dataset.index, 10) - 1 : allImgs.indexOf(img);
+        pageIdx = parseInt(container.dataset.index, 10) - 1;
       }
-      if (isNaN(pageIdx) || pageIdx < 0) pageIdx = allImgs.indexOf(img);
+      if (isNaN(pageIdx) || pageIdx < 0) pageIdx = 0;
       if (byIndex.has(pageIdx)) continue;
 
-      // Prefer 2× srcset URL for quality
+      // Prefer 2× srcset URL for higher quality
       let url = rawUrl;
       if (img.srcset) {
         const twox = img.srcset.split(",").map(s => s.trim()).find(s => s.endsWith(" 2x"));
@@ -312,12 +341,15 @@
       }
 
       if (pages.length === 0) {
-        // Diagnostics to help debug
-        const allImgs = document.querySelectorAll("img");
-        const pageEls = document.querySelectorAll("[data-index]");
+        const pageEls = Array.from(document.querySelectorAll("[data-index]"));
+        // Count imgs in both light DOM and shadow DOM for the diagnostic
+        let shadowImgCount = 0;
+        for (const c of pageEls) { if (getImgFromPageContainer(c)) shadowImgCount++; }
+        const lightImgCount = document.querySelectorAll("img").length;
         sendError(
           `No page images detected after scrolling. ` +
-          `Found ${allImgs.length} total <img> elements and ${pageEls.length} page containers on this frame (${location.hostname}). ` +
+          `${pageEls.length} page containers found, ` +
+          `${lightImgCount} light-DOM <img> + ${shadowImgCount} shadow-DOM <img> on ${location.hostname}. ` +
           `Make sure the document has finished loading and is visible before clicking Download.`
         );
         return;
