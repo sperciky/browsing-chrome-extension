@@ -96,7 +96,10 @@
     ];
     for (const sel of exactSelectors) {
       const el = document.querySelector(sel);
-      if (el && el.scrollHeight > el.clientHeight + 50) return el;
+      if (el && el.scrollHeight > el.clientHeight + 50) {
+        console.log(`[content] scroll container found via selector: "${sel}" scrollHeight=${el.scrollHeight} clientHeight=${el.clientHeight}`);
+        return el;
+      }
     }
     // Generic overflow scan
     const all = Array.from(document.querySelectorAll("*"));
@@ -104,8 +107,12 @@
       const el = all[i];
       const st = window.getComputedStyle(el);
       if ((st.overflowY === "scroll" || st.overflowY === "auto") &&
-          el.scrollHeight > el.clientHeight + 100) return el;
+          el.scrollHeight > el.clientHeight + 100) {
+        console.log(`[content] scroll container found via overflow scan: <${el.tagName} class="${el.className}"> scrollHeight=${el.scrollHeight}`);
+        return el;
+      }
     }
+    console.warn("[content] no scroll container found — will fall back to window.scrollTo");
     return null; // will fall back to window.scrollTo
   }
 
@@ -174,6 +181,7 @@
   async function triggerLazyLoad() {
     const scrollEl = findScrollContainer();
     const totalPages = detectTotalPages();
+    console.log(`[content] triggerLazyLoad: totalPages=${totalPages} scrollEl=${scrollEl ? scrollEl.tagName + '.' + scrollEl.className.slice(0,40) : 'null(window fallback)'}`);
     const delay = 220;
 
     // Use the detected container OR window.scrollTo (both, to be safe)
@@ -259,13 +267,21 @@
   function collectPageImages() {
     const byIndex = new Map();
     const pageContainers = Array.from(document.querySelectorAll("[data-index]"));
+    console.log(`[content] collectPageImages: ${pageContainers.length} [data-index] containers found`);
 
     for (const container of pageContainers) {
+      const dataIdx = container.dataset.index;
       const img = getImgFromPageContainer(container);
-      if (!img) continue;
+      if (!img) {
+        console.log(`[content]   data-index=${dataIdx}: no <img> found (shadow or light DOM)`);
+        continue;
+      }
 
       const rawUrl = img.currentSrc || img.src || "";
-      if (!isRealImageSrc(rawUrl)) continue;
+      if (!isRealImageSrc(rawUrl)) {
+        console.log(`[content]   data-index=${dataIdx}: img found but src is empty/data-URI: "${rawUrl.slice(0,60)}"`);
+        continue;
+      }
 
       // Page index from bg-N.png URL or from data-index attribute
       let pageIdx;
@@ -291,6 +307,8 @@
         }
       }
 
+      console.log(`[content]   data-index=${dataIdx} → pageIdx=${pageIdx}: ${url.slice(0, 80)}${url.length > 80 ? "…" : ""} (${img.naturalWidth}×${img.naturalHeight})`);
+
       byIndex.set(pageIdx, {
         url,
         width:  img.naturalWidth  || parseInt(img.getAttribute("width"))  || 794,
@@ -299,9 +317,11 @@
       });
     }
 
-    return Array.from(byIndex.entries())
+    const result = Array.from(byIndex.entries())
       .sort(([a], [b]) => a - b)
       .map(([, v]) => v);
+    console.log(`[content] collectPageImages result: ${result.length} pages collected`);
+    return result;
   }
 
   // ─── Main Download Flow ───────────────────────────────────────────────────
@@ -422,11 +442,22 @@
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === "FETCH_IMAGE") {
+      console.log(`[content] FETCH_IMAGE: ${msg.url}`);
       fetch(msg.url, { credentials: "include" })
-        .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.arrayBuffer(); })
+        .then(r => {
+          console.log(`[content] FETCH_IMAGE status=${r.status} ok=${r.ok} url=${msg.url}`);
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          return r.arrayBuffer();
+        })
         .then(buf => normalizeImageBuffer(buf))
-        .then(buf => sendResponse({ ok: true, imageData: bufToBase64(buf) }))
-        .catch(e  => sendResponse({ ok: false, error: e.message }));
+        .then(buf => {
+          console.log(`[content] FETCH_IMAGE returning ${buf.byteLength} bytes for ${msg.url}`);
+          sendResponse({ ok: true, imageData: bufToBase64(buf) });
+        })
+        .catch(e => {
+          console.warn(`[content] FETCH_IMAGE failed: ${e.message} url=${msg.url}`);
+          sendResponse({ ok: false, error: e.message });
+        });
       return true; // keep message channel open for async response
     }
 
