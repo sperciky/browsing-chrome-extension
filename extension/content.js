@@ -327,11 +327,14 @@
   // ─── Main Download Flow ───────────────────────────────────────────────────
 
   async function downloadPDF() {
+    const t0 = performance.now();
     try {
       sendProgress({ phase: "starting", loaded: 0, total: "?", scrollPercent: 0 });
 
       // Wait for the viewer React app to hydrate
+      const tWait = performance.now();
       const ready = await waitForViewerDOM(20000);
+      console.log(`[timing log] waitForViewerDOM: ${(performance.now() - tWait).toFixed(0)}ms — ready=${ready}`);
       if (!ready) {
         sendError(
           "Document viewer did not initialize within 20 seconds. " +
@@ -347,18 +350,25 @@
       sendProgress({ phase: "translated", folderName, filename });
 
       // Scroll to trigger lazy loading
+      const tScroll = performance.now();
       await triggerLazyLoad();
+      console.log(`[timing log] triggerLazyLoad: ${(performance.now() - tScroll).toFixed(0)}ms`);
 
       // Wait for decoded images
+      const tImgWait = performance.now();
       await waitForImages();
+      console.log(`[timing log] waitForImages (first pass): ${(performance.now() - tImgWait).toFixed(0)}ms`);
 
       // Collect image URLs with up to 3 retries (some lazy loaders are slow)
       let pages = collectPageImages();
       for (let attempt = 0; attempt < 3 && pages.length === 0; attempt++) {
+        console.log(`[timing log] collectPageImages returned 0 — retry ${attempt + 1}/3`);
         await sleep(1000);
         await waitForImages();
         pages = collectPageImages();
       }
+
+      console.log(`[timing log] page collection done: ${pages.length} pages in ${(performance.now() - t0).toFixed(0)}ms total`);
 
       if (pages.length === 0) {
         const pageEls = Array.from(document.querySelectorAll("[data-index]"));
@@ -377,6 +387,7 @@
 
       sendProgress({ phase: "building", loaded: 0, total: pages.length, scrollPercent: 100 });
 
+      console.log(`[timing log] sending BUILD_PDF to SW — ${pages.length} pages`);
       // Delegate PDF assembly to background service worker
       chrome.runtime.sendMessage({
         type: "BUILD_PDF",
@@ -385,6 +396,7 @@
         filename,
       }, () => {
         if (chrome.runtime.lastError) sendError(chrome.runtime.lastError.message);
+        else console.log(`[timing log] BUILD_PDF message accepted by SW`);
       });
 
     } catch (err) {
