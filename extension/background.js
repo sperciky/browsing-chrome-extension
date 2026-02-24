@@ -1,6 +1,6 @@
 // background.js  (Manifest V3 – ES module service worker)
-// Receives image URL list + metadata from content.js,
-// fetches images, builds PDF using pdf-lib, and triggers chrome.downloads.
+// Receives image URL list from content.js, fetches each image,
+// builds PDF with pdf-lib, and triggers chrome.downloads.
 
 import { PDFDocument } from "./lib/pdf-lib.esm.min.js";
 
@@ -46,20 +46,13 @@ function setError(msg) {
 
 // ─── Image helpers ────────────────────────────────────────────────────────
 
-function isJpeg(bytes) {
-  return bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF;
-}
-
-function isPng(bytes) {
-  return bytes[0] === 0x89 && bytes[1] === 0x50 &&
-         bytes[2] === 0x4E && bytes[3] === 0x47;
-}
+function isJpeg(b) { return b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF; }
+function isPng(b)  { return b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47; }
 
 async function fetchImageBytes(url) {
-  const response = await fetch(url, { credentials: "include" });
-  if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`);
-  const buffer = await response.arrayBuffer();
-  return new Uint8Array(buffer);
+  const r = await fetch(url, { credentials: "include" });
+  if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+  return new Uint8Array(await r.arrayBuffer());
 }
 
 // ─── PDF Builder ──────────────────────────────────────────────────────────
@@ -82,34 +75,25 @@ async function buildPDF(pages, onProgress) {
 
     let embeddedImage;
     try {
-      if (isJpeg(bytes)) {
-        embeddedImage = await pdfDoc.embedJpg(bytes);
-      } else if (isPng(bytes)) {
-        embeddedImage = await pdfDoc.embedPng(bytes);
-      } else {
-        // Try JPEG as fallback
-        embeddedImage = await pdfDoc.embedJpg(bytes);
+      embeddedImage = isJpeg(bytes) ? await pdfDoc.embedJpg(bytes)
+                    : isPng(bytes)  ? await pdfDoc.embedPng(bytes)
+                    : await pdfDoc.embedJpg(bytes);
+    } catch (e) {
+      // Try the other format as fallback
+      try {
+        embeddedImage = isPng(bytes) ? await pdfDoc.embedJpg(bytes) : await pdfDoc.embedPng(bytes);
+      } catch (_) {
+        console.warn(`[bg] embed failed page ${i + 1}: ${e.message}`);
+        pdfDoc.addPage([A4_W, A4_H]);
+        continue;
       }
-    } catch (embedErr) {
-      console.warn(`[bg] embed failed page ${i + 1}: ${embedErr.message}`);
-      pdfDoc.addPage([A4_W, A4_H]);
-      continue;
     }
 
-    // Fit into A4, preserve aspect ratio
-    const imgW = embeddedImage.width;
-    const imgH = embeddedImage.height;
-    const imgAspect = imgW / imgH;
-    const a4Aspect = A4_W / A4_H;
-
+    const imgAspect = embeddedImage.width / embeddedImage.height;
+    const a4Aspect  = A4_W / A4_H;
     let drawW, drawH;
-    if (imgAspect > a4Aspect) {
-      drawW = A4_W;
-      drawH = A4_W / imgAspect;
-    } else {
-      drawH = A4_H;
-      drawW = A4_H * imgAspect;
-    }
+    if (imgAspect > a4Aspect) { drawW = A4_W; drawH = A4_W / imgAspect; }
+    else                      { drawH = A4_H; drawW = A4_H * imgAspect; }
 
     const page = pdfDoc.addPage([A4_W, A4_H]);
     page.drawImage(embeddedImage, {
@@ -126,39 +110,46 @@ async function buildPDF(pages, onProgress) {
 // ─── Start download flow ──────────────────────────────────────────────────
 
 async function startDownload(tabId) {
-  // Step 1: Inject scripts if needed
+  // Inject content scripts into all frames (idempotent – duplicate injection is caught)
   try {
     await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
       files: ["translator.js", "content.js"],
     });
-  } catch (_) { /* already injected */ }
+  } catch (_) { /* already injected or page not scriptable */ }
 
-  // Step 2: Find the right frame and start scanning
+  // Short pause so the injected scripts can register their listeners
+  await new Promise(r => setTimeout(r, 150));
+
+  // Enumerate all frames and find the viewer frame (docviewer.yandex.ru)
   const frames = await chrome.webNavigation.getAllFrames({ tabId }).catch(() => []);
-  let accepted = false;
 
-  const tryFrame = async (frameId) => {
+  // Sort: prefer frames whose URL contains "docviewer" or "view"
+  const sorted = (frames || []).sort((a, b) => {
+    const aScore = (a.url || "").includes("docviewer") ? 1 : 0;
+    const bScore = (b.url || "").includes("docviewer") ? 1 : 0;
+    return bScore - aScore;
+  });
+
+  for (const frame of sorted) {
     try {
       const resp = await chrome.tabs.sendMessage(
-        tabId, { type: "START_DOWNLOAD" },
-        frameId !== undefined ? { frameId } : {}
+        tabId,
+        { type: "START_DOWNLOAD" },
+        { frameId: frame.frameId }
       );
-      return resp && resp.accepted;
-    } catch (_) { return false; }
-  };
-
-  for (const frame of (frames || [])) {
-    if (await tryFrame(frame.frameId)) { accepted = true; break; }
-  }
-
-  if (!accepted) {
-    if (await tryFrame(undefined)) {
-      accepted = true;
-    } else {
-      setError("Could not reach the page. Please refresh and try again.");
+      if (resp && resp.accepted) return; // viewer found and accepted
+    } catch (_) {
+      // Frame not ready or no content script – try next
     }
   }
+
+  // No frame accepted – show a helpful error
+  setError(
+    "Could not find the Yandex Document Viewer on this page. " +
+    "Make sure you are on a docs.yandex.ru or docviewer.yandex.ru page " +
+    "with a document open, then refresh and try again."
+  );
 }
 
 // ─── Message router ───────────────────────────────────────────────────────
@@ -172,13 +163,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case "PROGRESS": {
       const { phase, loaded, total, scrollPercent, rawTitle, folderName, filename } = msg;
-      if (phase)            state.phase        = phase;
-      if (loaded  != null)  state.loaded       = loaded;
-      if (total   != null)  state.total        = total;
+      if (phase)             state.phase        = phase;
+      if (loaded  != null)   state.loaded       = loaded;
+      if (total   != null)   state.total        = total;
       if (scrollPercent != null) state.scrollPercent = scrollPercent;
-      if (rawTitle)  state.rawTitle  = rawTitle;
+      if (rawTitle)   state.rawTitle   = rawTitle;
       if (folderName) state.folderName = folderName;
-      if (filename)  state.filename  = filename;
+      if (filename)   state.filename   = filename;
       state.error = null;
       broadcastState();
       sendResponse({ ok: true });
@@ -191,64 +182,57 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
 
     case "BUILD_PDF": {
-      // Content script collected all page image URLs; now background builds the PDF.
       const { pages, folderName, filename } = msg;
 
-      state.phase = "building";
-      state.loaded = 0;
-      state.total = pages.length;
+      state.phase      = "building";
+      state.loaded     = 0;
+      state.total      = pages.length;
       state.folderName = folderName;
-      state.filename = filename;
+      state.filename   = filename;
       broadcastState();
 
       buildPDF(pages, (current, total) => {
         state.loaded = current;
-        state.total = total;
+        state.total  = total;
         broadcastState();
-      }).then(async (pdfBytes) => {
+      })
+      .then(pdfBytes => {
         state.phase = "saving";
         broadcastState();
 
-        // Create blob URL in extension context so chrome.downloads can access it
-        const blob = new Blob([pdfBytes], { type: "application/pdf" });
+        const blob    = new Blob([pdfBytes], { type: "application/pdf" });
         const blobUrl = URL.createObjectURL(blob);
-        const downloadPath = `${folderName}/${filename}`;
 
         chrome.downloads.download({
           url: blobUrl,
-          filename: downloadPath,
+          filename: `${folderName}/${filename}`,
           saveAs: false,
           conflictAction: "uniquify",
-        }, (downloadId) => {
-          // Revoke after a minute
-          setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
-
+        }, () => {
+          setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
           if (chrome.runtime.lastError) {
             setError(chrome.runtime.lastError.message);
           } else {
-            state.running = false;
-            state.phase = "done";
+            state.running   = false;
+            state.phase     = "done";
             state.pageCount = pages.length;
             broadcastState();
           }
         });
-
-      }).catch(err => {
-        setError(err.message || String(err));
-      });
+      })
+      .catch(err => setError(err.message || String(err)));
 
       sendResponse({ ok: true });
       return true;
     }
 
-    case "DONE": {
-      state.running = false;
-      state.phase = "done";
+    case "DONE":
+      state.running   = false;
+      state.phase     = "done";
       state.pageCount = msg.pageCount || state.pageCount;
       broadcastState();
       sendResponse({ ok: true });
       return true;
-    }
   }
 });
 
@@ -267,11 +251,11 @@ chrome.runtime.onConnect.addListener((port) => {
       if (state.running) { broadcastState(); return; }
       resetState();
       state.running = true;
-      state.phase = "starting";
+      state.phase   = "starting";
       broadcastState();
 
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (!tab) { setError("No active tab found"); return; }
+      if (!tab) { setError("No active tab found."); return; }
 
       await startDownload(tab.id);
     }
