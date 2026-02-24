@@ -35,12 +35,20 @@ function deleteFromIDB(db) {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "PREPARE_BLOB") {
+    const t0 = performance.now();
     openIDB()
       .then(db => loadFromIDB(db).then(bytes => ({ db, bytes })))
       .then(({ db, bytes }) => {
         if (!bytes) throw new Error("No PDF data found in IndexedDB");
+        const tIDB = performance.now() - t0;
+        console.log(`[timing log] offscreen IDB read: ${tIDB.toFixed(0)}ms (${bytes.length} bytes)`);
+
+        const tBlob = performance.now();
         const blob = new Blob([bytes], { type: "application/pdf" });
         const blobUrl = URL.createObjectURL(blob);
+        console.log(`[timing log] offscreen createObjectURL: ${(performance.now() - tBlob).toFixed(0)}ms`);
+        console.log(`[timing log] offscreen PREPARE_BLOB total: ${(performance.now() - t0).toFixed(0)}ms`);
+
         // Clean up IDB entry (best effort — don't block the response)
         deleteFromIDB(db).catch(() => {});
         // Return the blob URL to the SW — SW will call chrome.downloads.download()
