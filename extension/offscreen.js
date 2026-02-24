@@ -1,8 +1,10 @@
 // offscreen.js
-// Runs in an offscreen document (Chrome 116+) where URL.createObjectURL is available.
-// The service worker stores the PDF Uint8Array in IndexedDB under key "pending",
-// then sends OFFSCREEN_DOWNLOAD with the target filename.
-// This page reads the bytes, creates a blob: URL, triggers the download, and closes itself.
+// Runs in an offscreen document (Chrome 116+).
+// chrome.downloads is NOT available here — only runtime, storage, i18n, extension are.
+//
+// PREPARE_BLOB  → reads PDF bytes from IndexedDB, creates a blob: URL, returns it to SW.
+//                 SW then calls chrome.downloads.download() with that URL.
+// CLEANUP_OFFSCREEN → revokes the blob URL and closes this document.
 
 function openIDB() {
   return new Promise((resolve, reject) => {
@@ -31,38 +33,26 @@ function deleteFromIDB(db) {
   });
 }
 
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.type !== "OFFSCREEN_DOWNLOAD") return;
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type === "PREPARE_BLOB") {
+    openIDB()
+      .then(db => loadFromIDB(db).then(bytes => ({ db, bytes })))
+      .then(({ db, bytes }) => {
+        if (!bytes) throw new Error("No PDF data found in IndexedDB");
+        const blob = new Blob([bytes], { type: "application/pdf" });
+        const blobUrl = URL.createObjectURL(blob);
+        // Clean up IDB entry (best effort — don't block the response)
+        deleteFromIDB(db).catch(() => {});
+        // Return the blob URL to the SW — SW will call chrome.downloads.download()
+        // Keep this document alive (don't close) until CLEANUP_OFFSCREEN arrives
+        sendResponse({ ok: true, blobUrl });
+      })
+      .catch(err => sendResponse({ ok: false, error: err.message }));
+    return true; // keep message channel open for async sendResponse
+  }
 
-  openIDB()
-    .then(db => loadFromIDB(db).then(bytes => ({ db, bytes })))
-    .then(({ db, bytes }) => {
-      if (!bytes) throw new Error("No PDF data found in IndexedDB");
-
-      const blob = new Blob([bytes], { type: "application/pdf" });
-      const url = URL.createObjectURL(blob);
-
-      return new Promise((resolve, reject) => {
-        chrome.downloads.download(
-          { url, filename: msg.filename, saveAs: false, conflictAction: "uniquify" },
-          (downloadId) => {
-            URL.revokeObjectURL(url);
-            if (chrome.runtime.lastError) {
-              reject(new Error(chrome.runtime.lastError.message));
-            } else {
-              resolve({ db, downloadId });
-            }
-          }
-        );
-      });
-    })
-    .then(({ db }) => deleteFromIDB(db))
-    .then(() => {
-      chrome.runtime.sendMessage({ type: "OFFSCREEN_DONE" });
-      return chrome.offscreen.closeDocument();
-    })
-    .catch(err => {
-      chrome.runtime.sendMessage({ type: "OFFSCREEN_ERROR", message: err.message });
-      chrome.offscreen.closeDocument().catch(() => {});
-    });
+  if (msg.type === "CLEANUP_OFFSCREEN") {
+    if (msg.blobUrl) URL.revokeObjectURL(msg.blobUrl);
+    chrome.offscreen.closeDocument().catch(() => {});
+  }
 });

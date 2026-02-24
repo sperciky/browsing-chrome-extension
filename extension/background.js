@@ -72,7 +72,8 @@ async function storePdfInIDB(bytes) {
 
 // ─── Offscreen document trigger ───────────────────────────────────────────
 // URL.createObjectURL is not available in MV3 service workers.
-// We delegate blob-URL creation + chrome.downloads call to an offscreen page.
+// The offscreen doc creates the blob: URL and returns it; the SW calls
+// chrome.downloads.download() (which IS available in the SW).
 
 async function triggerOffscreenDownload(filename) {
   const offscreenUrl = chrome.runtime.getURL("offscreen.html");
@@ -84,8 +85,32 @@ async function triggerOffscreenDownload(filename) {
       justification: "Create blob: URL for large PDF download — avoids data URI size limits",
     });
   }
-  // offscreen.js listens for this and does the actual download
-  chrome.runtime.sendMessage({ type: "OFFSCREEN_DOWNLOAD", filename });
+
+  // Ask offscreen doc to read IDB bytes and produce a blob: URL
+  const resp = await new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage({ type: "PREPARE_BLOB" }, (r) => {
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+      else resolve(r);
+    });
+  });
+
+  if (!resp?.ok) throw new Error(resp?.error || "Offscreen failed to create blob URL");
+
+  const { blobUrl } = resp;
+  console.log(`[bg] got blob URL from offscreen, triggering download: ${filename}`);
+
+  // SW has access to chrome.downloads; offscreen does not
+  return new Promise((resolve, reject) => {
+    chrome.downloads.download(
+      { url: blobUrl, filename, saveAs: false, conflictAction: "uniquify" },
+      (downloadId) => {
+        // Tell offscreen to revoke the blob URL and close itself
+        chrome.runtime.sendMessage({ type: "CLEANUP_OFFSCREEN", blobUrl });
+        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+        else resolve(downloadId);
+      }
+    );
+  });
 }
 
 async function fetchImageBytes(url) {
@@ -291,27 +316,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await storePdfInIDB(pdfBytes);
         console.log(`[bg] IDB write ok — triggering offscreen download`);
         await triggerOffscreenDownload(`${folderName}/${filename}`);
-        // Final state is set when OFFSCREEN_DONE arrives (see message router below)
+        state.running   = false;
+        state.phase     = "done";
+        state.pageCount = pages.length;
+        broadcastState();
       })
       .catch(err => setError(err.message || String(err)));
 
       sendResponse({ ok: true });
       return true;
     }
-
-    case "OFFSCREEN_DONE":
-      console.log("[bg] offscreen download complete");
-      state.running = false;
-      state.phase   = "done";
-      broadcastState();
-      sendResponse({ ok: true });
-      return true;
-
-    case "OFFSCREEN_ERROR":
-      console.error(`[bg] offscreen download error: ${msg.message}`);
-      setError(msg.message || "Download failed in offscreen document");
-      sendResponse({ ok: true });
-      return true;
 
     case "DONE":
       state.running   = false;
