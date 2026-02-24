@@ -49,6 +49,9 @@ function setError(msg) {
 function isJpeg(b) { return b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF; }
 function isPng(b)  { return b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47; }
 
+/** Format a millisecond value as "123ms" or "1.23s" */
+const ms = t => t < 1000 ? `${t.toFixed(0)}ms` : `${(t / 1000).toFixed(2)}s`;
+
 // ─── IndexedDB helpers (shared with offscreen.js via the same origin) ─────
 
 function openPdfIDB() {
@@ -76,23 +79,30 @@ async function storePdfInIDB(bytes) {
 // chrome.downloads.download() (which IS available in the SW).
 
 async function triggerOffscreenDownload(filename) {
+  const t0 = performance.now();
   const offscreenUrl = chrome.runtime.getURL("offscreen.html");
   const hasDoc = await chrome.offscreen.hasDocument().catch(() => false);
   if (!hasDoc) {
+    const tCreate = performance.now();
     await chrome.offscreen.createDocument({
       url: offscreenUrl,
       reasons: ["BLOBS"],
       justification: "Create blob: URL for large PDF download — avoids data URI size limits",
     });
+    console.log(`[timing log] offscreen createDocument: ${ms(performance.now() - tCreate)}`);
+  } else {
+    console.log(`[timing log] offscreen doc already existed — skipped createDocument`);
   }
 
   // Ask offscreen doc to read IDB bytes and produce a blob: URL
+  const tBlob = performance.now();
   const resp = await new Promise((resolve, reject) => {
     chrome.runtime.sendMessage({ type: "PREPARE_BLOB" }, (r) => {
       if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
       else resolve(r);
     });
   });
+  console.log(`[timing log] PREPARE_BLOB roundtrip (IDB read + createObjectURL): ${ms(performance.now() - tBlob)}`);
 
   if (!resp?.ok) throw new Error(resp?.error || "Offscreen failed to create blob URL");
 
@@ -100,10 +110,13 @@ async function triggerOffscreenDownload(filename) {
   console.log(`[bg] got blob URL from offscreen, triggering download: ${filename}`);
 
   // SW has access to chrome.downloads; offscreen does not
+  const tDl = performance.now();
   return new Promise((resolve, reject) => {
     chrome.downloads.download(
       { url: blobUrl, filename, saveAs: false, conflictAction: "uniquify" },
       (downloadId) => {
+        console.log(`[timing log] chrome.downloads.download() callback: ${ms(performance.now() - tDl)}`);
+        console.log(`[timing log] triggerOffscreenDownload total: ${ms(performance.now() - t0)}`);
         // Tell offscreen to revoke the blob URL and close itself
         chrome.runtime.sendMessage({ type: "CLEANUP_OFFSCREEN", blobUrl });
         if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
@@ -152,27 +165,36 @@ function fetchViaContentScript(tabId, frameId, url) {
 
 // context = { tabId, frameId } – used to proxy fetches through the content script
 async function buildPDF(pages, context, onProgress) {
+  const t0 = performance.now();
   const pdfDoc = await PDFDocument.create();
   console.log(`[bg] buildPDF: ${pages.length} pages, tabId=${context.tabId}, frameId=${context.frameId}`);
   pages.forEach((p, i) => console.log(`[bg]   page ${i + 1}: ${p.url} (${p.width}×${p.height})`));
+
+  let totalFetchMs = 0;
+  let totalEmbedMs = 0;
 
   for (let i = 0; i < pages.length; i++) {
     const { url, width, height } = pages[i];
     if (onProgress) onProgress(i + 1, pages.length);
 
     let bytes;
+    const tFetch = performance.now();
     try {
       // Primary: fetch via content script (has full tab cookie context, handles WebP→JPEG)
       bytes = await fetchViaContentScript(context.tabId, context.frameId, url);
-      console.log(`[bg] page ${i + 1}: fetched ${bytes.length} bytes via content-script`);
+      const fetchMs = performance.now() - tFetch;
+      totalFetchMs += fetchMs;
+      console.log(`[timing log] page ${i + 1} fetch (content-script): ${ms(fetchMs)} — ${bytes.length} bytes`);
     } catch (csErr) {
       console.warn(`[bg] page ${i + 1}: content-script fetch failed (${csErr.message}), trying direct fetch`);
       // Fallback: direct fetch from service worker
       try {
         bytes = await fetchImageBytes(url);
-        console.log(`[bg] page ${i + 1}: fetched ${bytes.length} bytes via direct fetch`);
+        const fetchMs = performance.now() - tFetch;
+        totalFetchMs += fetchMs;
+        console.log(`[timing log] page ${i + 1} fetch (direct fallback): ${ms(fetchMs)} — ${bytes.length} bytes`);
       } catch (e) {
-        console.warn(`[bg] page ${i + 1}: BOTH fetches failed — adding blank page. Error: ${e.message}`);
+        console.warn(`[bg] page ${i + 1}: BOTH fetches failed (${ms(performance.now() - tFetch)}) — adding blank page. Error: ${e.message}`);
         pdfDoc.addPage([A4_W, A4_H]);
         continue;
       }
@@ -182,20 +204,25 @@ async function buildPDF(pages, context, onProgress) {
     const fmt = isJpeg(bytes) ? "JPEG" : isPng(bytes) ? "PNG" : `UNKNOWN(0x${bytes[0].toString(16)}${bytes[1].toString(16)}${bytes[2].toString(16)}${bytes[3].toString(16)})`;
     console.log(`[bg] page ${i + 1}: format=${fmt} bytes=${bytes.length}`);
 
+    const tEmbed = performance.now();
     let embeddedImage;
     try {
       embeddedImage = isJpeg(bytes) ? await pdfDoc.embedJpg(bytes)
                     : isPng(bytes)  ? await pdfDoc.embedPng(bytes)
                     : await pdfDoc.embedJpg(bytes);
-      console.log(`[bg] page ${i + 1}: embedded ok`);
+      const embedMs = performance.now() - tEmbed;
+      totalEmbedMs += embedMs;
+      console.log(`[timing log] page ${i + 1} embed: ${ms(embedMs)}`);
     } catch (e) {
       console.warn(`[bg] page ${i + 1}: embed failed (${e.message}), trying alternate format`);
       // Try the other format as fallback
       try {
         embeddedImage = isPng(bytes) ? await pdfDoc.embedJpg(bytes) : await pdfDoc.embedPng(bytes);
-        console.log(`[bg] page ${i + 1}: embedded ok (alternate format)`);
+        const embedMs = performance.now() - tEmbed;
+        totalEmbedMs += embedMs;
+        console.log(`[timing log] page ${i + 1} embed (alternate format): ${ms(embedMs)}`);
       } catch (e2) {
-        console.warn(`[bg] page ${i + 1}: BOTH embed formats failed — adding blank page. Error: ${e2.message}`);
+        console.warn(`[bg] page ${i + 1}: BOTH embed formats failed (${ms(performance.now() - tEmbed)}) — adding blank page. Error: ${e2.message}`);
         pdfDoc.addPage([A4_W, A4_H]);
         continue;
       }
@@ -216,7 +243,17 @@ async function buildPDF(pages, context, onProgress) {
     });
   }
 
-  return pdfDoc.save();
+  const avgFetch = pages.length > 0 ? totalFetchMs / pages.length : 0;
+  const avgEmbed = pages.length > 0 ? totalEmbedMs / pages.length : 0;
+  console.log(`[timing log] all ${pages.length} pages fetched  — total: ${ms(totalFetchMs)}, avg: ${ms(avgFetch)}/page`);
+  console.log(`[timing log] all ${pages.length} pages embedded — total: ${ms(totalEmbedMs)}, avg: ${ms(avgEmbed)}/page`);
+
+  const tSave = performance.now();
+  const result = await pdfDoc.save();
+  console.log(`[timing log] pdfDoc.save(): ${ms(performance.now() - tSave)} — output: ${result.length} bytes`);
+  console.log(`[timing log] buildPDF total: ${ms(performance.now() - t0)}`);
+
+  return result;
 }
 
 // ─── Start download flow ──────────────────────────────────────────────────
@@ -304,18 +341,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       state.filename   = filename;
       broadcastState();
 
+      const tBuildStart = performance.now();
       buildPDF(pages, context, (current, total) => {
         state.loaded = current;
         state.total  = total;
         broadcastState();
       })
       .then(async pdfBytes => {
+        console.log(`[timing log] ── buildPDF phase: ${ms(performance.now() - tBuildStart)}`);
         state.phase = "saving";
         broadcastState();
-        console.log(`[bg] PDF built: ${pdfBytes.length} bytes — storing in IDB`);
+
+        const tIDB = performance.now();
         await storePdfInIDB(pdfBytes);
-        console.log(`[bg] IDB write ok — triggering offscreen download`);
+        console.log(`[timing log] ── storePdfInIDB: ${ms(performance.now() - tIDB)} (${pdfBytes.length} bytes)`);
+
+        const tOffscreen = performance.now();
         await triggerOffscreenDownload(`${folderName}/${filename}`);
+        console.log(`[timing log] ── triggerOffscreenDownload: ${ms(performance.now() - tOffscreen)}`);
+
+        console.log(`[timing log] ── TOTAL from BUILD_PDF to download started: ${ms(performance.now() - tBuildStart)}`);
         state.running   = false;
         state.phase     = "done";
         state.pageCount = pages.length;
